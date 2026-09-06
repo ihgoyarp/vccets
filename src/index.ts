@@ -1,15 +1,18 @@
 /**
  * ============================================================
- * E-Commerce Checkout & Promotion Engine
+ * E-Commerce Checkout & Promotion Engine (v2 - Change Request)
  * ============================================================
- * Modul TypeScript untuk:
- * 1. Pengecekan ketersediaan stok produk
- * 2. Perhitungan total harga belanjaan
- * 3. Penerapan kupon diskon (persentase / nominal tetap)
+ * Perubahan dari versi sebelumnya:
+ * 1. STACKING DISCOUNT   -> bisa pakai >1 kode promo sekaligus
+ *                           (mis. diskon kategori + diskon metode bayar)
+ * 2. FLASH SALE          -> promo bisa dibatasi jam tayang & kuota harian
+ * 3. EDGE CASE HANDLING  -> jika stok/kuota berubah di tengah proses
+ *                           checkout, promo terkait otomatis dibatalkan
+ *                           dan total dihitung ulang (bukan crash)
  *
- * Cara menjalankan (lihat bagian paling bawah file untuk contoh):
- *   npm install -D typescript ts-node
- *   npx ts-node checkout-engine.ts
+ * Cara menjalankan:
+ *   npx tsc checkout-engine.ts && node checkout-engine.js
+ *   (atau: npx tsx checkout-engine.ts / npx ts-node checkout-engine.ts)
  * ============================================================
  */
 
@@ -20,8 +23,9 @@
 interface Product {
   id: string;
   name: string;
-  price: number; // harga satuan dalam Rupiah
-  stock: number; // jumlah stok tersedia
+  price: number;
+  stock: number;
+  category: string; // dipakai untuk promo bertipe CATEGORY
 }
 
 interface CartItem {
@@ -29,33 +33,70 @@ interface CartItem {
   quantity: number;
 }
 
-type CouponType = "PERCENTAGE" | "FIXED";
+type PromoValueType = "PERCENTAGE" | "FIXED";
+type PromoScope = "CART" | "CATEGORY" | "PAYMENT_METHOD";
 
-interface Coupon {
+interface PromoSchedule {
+  startHour: number; // 0-23, inklusif
+  endHour: number; // 0-23, eksklusif (mis. 12-14 -> berlaku 12:00:00 s.d. 13:59:59)
+}
+
+interface Promo {
   code: string;
-  type: CouponType;
-  value: number; // jika PERCENTAGE -> 0-100, jika FIXED -> nominal Rupiah
-  minPurchase?: number; // syarat minimum belanja (opsional)
-  maxDiscount?: number; // batas maksimum potongan untuk tipe PERCENTAGE (opsional)
+  description?: string;
+  valueType: PromoValueType;
+  value: number; // PERCENTAGE: 0-100, FIXED: nominal Rupiah
+  scope: PromoScope;
+  categoryId?: string; // wajib jika scope === "CATEGORY"
+  paymentMethod?: string; // wajib jika scope === "PAYMENT_METHOD" (mis. "GOPAY", "CREDIT_CARD")
+  minPurchase?: number; // syarat minimum belanja pada cakupan (scope) terkait
+  maxDiscount?: number; // batas maksimum potongan (khusus PERCENTAGE)
+  schedule?: PromoSchedule; // jam berlaku (flash sale). Kosong = berlaku sepanjang hari
+  dailyQuota?: number; // batas jumlah pemakaian per hari. Kosong = tanpa batas
+  stackable?: boolean; // default true. false = tidak bisa digabung promo lain
+}
+
+interface ItemLine {
+  productId: string;
+  name: string;
+  category: string;
+  requestedQuantity: number; // qty yang diminta user di awal
+  quantity: number; // qty final setelah validasi commit-time
+  unitPrice: number;
+  subtotal: number; // unitPrice * quantity (final)
+  adjusted: boolean; // true jika quantity dikurangi/dibatalkan karena stok berubah
+}
+
+interface AppliedPromoDetail {
+  code: string;
+  scope: PromoScope;
+  valueType: PromoValueType;
+  discount: number;
+}
+
+interface RejectedPromoDetail {
+  code: string;
+  reason: string;
+}
+
+interface CheckoutOptions {
+  paymentMethod?: string; // mis. "GOPAY", "CREDIT_CARD", "COD"
+  now?: Date; // waktu transaksi, default: waktu saat ini (untuk testing flash sale)
 }
 
 interface CheckoutResult {
   success: boolean;
   message: string;
-  items: {
-    productId: string;
-    name: string;
-    quantity: number;
-    unitPrice: number;
-    subtotal: number;
-  }[];
-  subtotal: number;
-  discount: number;
-  couponApplied: string | null;
+  items: ItemLine[];
+  subtotal: number; // total setelah kemungkinan penyesuaian stok, sebelum diskon
+  totalDiscount: number;
+  appliedPromos: AppliedPromoDetail[];
+  rejectedPromos: RejectedPromoDetail[];
+  warnings: string[]; // catatan penyesuaian otomatis (stok/kuota berubah, dsb)
   total: number;
+  paymentMethod?: string;
 }
 
-// Error kustom agar mudah dibedakan penyebab kegagalannya
 class CheckoutError extends Error {
   constructor(message: string) {
     super(message);
@@ -69,32 +110,46 @@ class CheckoutError extends Error {
 
 class CheckoutEngine {
   private products: Map<string, Product> = new Map();
-  private coupons: Map<string, Coupon> = new Map();
+  private promos: Map<string, Promo> = new Map();
+  // Pemakaian kuota promo per hari: key = kode promo, value = { tanggal, jumlah terpakai }
+  private promoUsage: Map<string, { date: string; used: number }> = new Map();
 
-  constructor(products: Product[] = [], coupons: Coupon[] = []) {
+  constructor(products: Product[] = [], promos: Promo[] = []) {
     products.forEach((p) => this.products.set(p.id, { ...p }));
-    coupons.forEach((c) => this.coupons.set(c.code.toUpperCase(), { ...c }));
+    promos.forEach((pr) => this.promos.set(pr.code.toUpperCase(), { ...pr }));
   }
 
-  // ---------- Manajemen data (helper) ----------
+  // ---------- Manajemen data ----------
 
   addProduct(product: Product): void {
     this.products.set(product.id, { ...product });
   }
 
-  addCoupon(coupon: Coupon): void {
-    this.coupons.set(coupon.code.toUpperCase(), { ...coupon });
+  addPromo(promo: Promo): void {
+    this.promos.set(promo.code.toUpperCase(), { ...promo });
   }
 
   getProduct(productId: string): Product | undefined {
     return this.products.get(productId);
   }
 
+  /** Simulasi perubahan stok oleh proses lain (mis. transaksi customer lain) di tengah checkout. */
+  simulateExternalStockChange(productId: string, newStock: number): void {
+    const p = this.products.get(productId);
+    if (p) p.stock = newStock;
+  }
+
+  /** Simulasi kuota promo mendadak habis dipakai transaksi lain (untuk testing race condition). */
+  simulateExternalPromoUsage(code: string, usedCount: number, now: Date = new Date()): void {
+    this.promoUsage.set(code.toUpperCase(), { date: this.getTodayKey(now), used: usedCount });
+  }
+
+  private getTodayKey(date: Date): string {
+    return date.toISOString().slice(0, 10); // YYYY-MM-DD
+  }
+
   // ---------- FITUR 1: Pengecekan ketersediaan stok ----------
 
-  /**
-   * Mengecek apakah produk tersedia dengan jumlah yang diminta.
-   */
   checkStock(productId: string, quantity: number): boolean {
     const product = this.products.get(productId);
     if (!product) {
@@ -106,24 +161,15 @@ class CheckoutEngine {
     return product.stock >= quantity;
   }
 
-  /**
-   * Mengecek ketersediaan stok untuk seluruh isi keranjang sekaligus.
-   * Mengembalikan daftar item yang stoknya tidak mencukupi.
-   */
   checkCartStock(cartItems: CartItem[]): { productId: string; requested: number; available: number }[] {
     const shortages: { productId: string; requested: number; available: number }[] = [];
-
     for (const item of cartItems) {
       const product = this.products.get(item.productId);
       if (!product) {
         throw new CheckoutError(`Produk dengan ID "${item.productId}" tidak ditemukan.`);
       }
       if (product.stock < item.quantity) {
-        shortages.push({
-          productId: item.productId,
-          requested: item.quantity,
-          available: product.stock,
-        });
+        shortages.push({ productId: item.productId, requested: item.quantity, available: product.stock });
       }
     }
     return shortages;
@@ -131,97 +177,159 @@ class CheckoutEngine {
 
   // ---------- FITUR 2: Perhitungan total harga ----------
 
-  /**
-   * Menghitung subtotal (harga x kuantitas) untuk seluruh item di keranjang,
-   * tanpa memotong stok atau menerapkan kupon.
-   */
-  calculateSubtotal(cartItems: CartItem[]): {
-    items: { productId: string; name: string; quantity: number; unitPrice: number; subtotal: number }[];
+  /** Membangun rincian item + subtotal per kategori dari isi keranjang (snapshot awal). */
+  private buildItemLines(cartItems: CartItem[]): {
+    items: ItemLine[];
     subtotal: number;
+    categorySubtotals: Map<string, number>;
   } {
-    const items: { productId: string; name: string; quantity: number; unitPrice: number; subtotal: number }[] = [];
+    const items: ItemLine[] = [];
+    const categorySubtotals = new Map<string, number>();
     let subtotal = 0;
 
-    for (const item of cartItems) {
-      const product = this.products.get(item.productId);
+    for (const ci of cartItems) {
+      const product = this.products.get(ci.productId);
       if (!product) {
-        throw new CheckoutError(`Produk dengan ID "${item.productId}" tidak ditemukan.`);
+        throw new CheckoutError(`Produk dengan ID "${ci.productId}" tidak ditemukan.`);
       }
-      if (item.quantity <= 0) {
-        throw new CheckoutError(`Kuantitas untuk produk "${item.productId}" harus lebih dari 0.`);
+      if (ci.quantity <= 0) {
+        throw new CheckoutError(`Kuantitas untuk produk "${ci.productId}" harus lebih dari 0.`);
       }
 
-      const itemSubtotal = product.price * item.quantity;
-      subtotal += itemSubtotal;
+      const lineSubtotal = product.price * ci.quantity;
+      subtotal += lineSubtotal;
+      categorySubtotals.set(product.category, (categorySubtotals.get(product.category) ?? 0) + lineSubtotal);
 
       items.push({
         productId: product.id,
         name: product.name,
-        quantity: item.quantity,
+        category: product.category,
+        requestedQuantity: ci.quantity,
+        quantity: ci.quantity,
         unitPrice: product.price,
-        subtotal: itemSubtotal,
+        subtotal: lineSubtotal,
+        adjusted: false,
       });
     }
 
+    return { items, subtotal, categorySubtotals };
+  }
+
+  calculateSubtotal(cartItems: CartItem[]): { items: ItemLine[]; subtotal: number } {
+    const { items, subtotal } = this.buildItemLines(cartItems);
     return { items, subtotal };
   }
 
-  // ---------- FITUR 3: Penerapan kupon diskon ----------
+  // ---------- FITUR 3: Evaluasi promo (stacking, jadwal, kuota) ----------
 
   /**
-   * Menghitung besaran diskon berdasarkan kode kupon dan subtotal belanja.
-   * Melempar CheckoutError jika kupon tidak valid atau syarat tidak terpenuhi.
+   * Mengevaluasi satu promo terhadap kondisi keranjang saat ini.
+   * Dipakai dua kali: sekali di validasi awal, sekali lagi di commit-time
+   * (untuk mendeteksi perubahan stok/kuota yang terjadi di tengah proses).
    */
-  applyCoupon(couponCode: string, subtotal: number): { discount: number; coupon: Coupon } {
-    const coupon = this.coupons.get(couponCode.toUpperCase());
-
-    if (!coupon) {
-      throw new CheckoutError(`Kode kupon "${couponCode}" tidak valid atau sudah tidak berlaku.`);
+  private evaluatePromo(
+    promo: Promo,
+    ctx: {
+      cartSubtotal: number;
+      categorySubtotals: Map<string, number>;
+      paymentMethod?: string;
+      now: Date;
+      totalRequested: number; // jumlah kode promo unik yang diminta dalam transaksi ini
+    }
+  ): { valid: boolean; reason?: string; discount?: number } {
+    // Cek exclusivity (tidak bisa stacking)
+    if (promo.stackable === false && ctx.totalRequested > 1) {
+      return { valid: false, reason: `Promo "${promo.code}" tidak dapat digabung dengan promo lain.` };
     }
 
-    if (coupon.minPurchase && subtotal < coupon.minPurchase) {
-      throw new CheckoutError(
-        `Kupon "${coupon.code}" membutuhkan minimum belanja Rp${coupon.minPurchase.toLocaleString(
-          "id-ID"
-        )}. Subtotal Anda Rp${subtotal.toLocaleString("id-ID")}.`
-      );
-    }
-
-    let discount = 0;
-
-    if (coupon.type === "PERCENTAGE") {
-      discount = (coupon.value / 100) * subtotal;
-      if (coupon.maxDiscount && discount > coupon.maxDiscount) {
-        discount = coupon.maxDiscount;
+    // Cek jadwal (flash sale)
+    if (promo.schedule) {
+      const hour = ctx.now.getHours();
+      const inWindow = hour >= promo.schedule.startHour && hour < promo.schedule.endHour;
+      if (!inWindow) {
+        return {
+          valid: false,
+          reason: `Promo hanya berlaku pukul ${promo.schedule.startHour}:00-${promo.schedule.endHour}:00.`,
+        };
       }
-    } else if (coupon.type === "FIXED") {
-      discount = coupon.value;
     }
 
-    // Diskon tidak boleh melebihi subtotal (hindari total minus)
-    if (discount > subtotal) {
-      discount = subtotal;
+    // Cek kuota harian (baca saja, belum mengunci/reserve)
+    if (promo.dailyQuota !== undefined) {
+      const today = this.getTodayKey(ctx.now);
+      const rec = this.promoUsage.get(promo.code.toUpperCase());
+      const used = rec && rec.date === today ? rec.used : 0;
+      if (used >= promo.dailyQuota) {
+        return { valid: false, reason: `Kuota harian promo "${promo.code}" sudah habis (maks ${promo.dailyQuota}/hari).` };
+      }
     }
 
-    return { discount, coupon };
+    // Tentukan basis perhitungan sesuai scope
+    let base = 0;
+    if (promo.scope === "CART") {
+      base = ctx.cartSubtotal;
+    } else if (promo.scope === "CATEGORY") {
+      base = ctx.categorySubtotals.get(promo.categoryId ?? "") ?? 0;
+      if (base <= 0) {
+        return { valid: false, reason: `Tidak ada produk kategori "${promo.categoryId}" di keranjang.` };
+      }
+    } else if (promo.scope === "PAYMENT_METHOD") {
+      if (!ctx.paymentMethod || ctx.paymentMethod !== promo.paymentMethod) {
+        return { valid: false, reason: `Promo ini memerlukan metode pembayaran "${promo.paymentMethod}".` };
+      }
+      base = ctx.cartSubtotal;
+    }
+
+    if (promo.minPurchase && base < promo.minPurchase) {
+      return {
+        valid: false,
+        reason: `Minimum belanja Rp${promo.minPurchase.toLocaleString("id-ID")} untuk cakupan promo ini belum terpenuhi.`,
+      };
+    }
+
+    let discount = promo.valueType === "PERCENTAGE" ? (promo.value / 100) * base : promo.value;
+    if (promo.valueType === "PERCENTAGE" && promo.maxDiscount && discount > promo.maxDiscount) {
+      discount = promo.maxDiscount;
+    }
+    if (discount > base) discount = base; // diskon 1 promo tidak boleh melebihi basisnya sendiri
+
+    return { valid: true, discount };
   }
 
-  // ---------- PROSES CHECKOUT LENGKAP (menggabungkan 3 fitur) ----------
+  /** Mengunci (reserve) satu slot kuota harian promo secara atomik. Return false jika sudah penuh. */
+  private reserveQuota(code: string, dailyQuota: number, now: Date): boolean {
+    const key = code.toUpperCase();
+    const today = this.getTodayKey(now);
+    const rec = this.promoUsage.get(key);
+
+    if (!rec || rec.date !== today) {
+      this.promoUsage.set(key, { date: today, used: 1 });
+      return dailyQuota >= 1;
+    }
+    if (rec.used >= dailyQuota) return false;
+    rec.used += 1;
+    return true;
+  }
+
+  // ---------- PROSES CHECKOUT LENGKAP (2 fase: validasi -> commit) ----------
 
   /**
-   * Menjalankan alur checkout penuh:
-   * 1. Cek stok semua item
-   * 2. Hitung subtotal
-   * 3. Terapkan kupon (jika ada)
-   * Mengembalikan objek CheckoutResult yang siap ditampilkan/disimpan.
-   * Stok produk akan dikurangi otomatis jika checkout berhasil.
+   * Alur checkout:
+   *  FASE 1 (validasi awal): cek stok & kelayakan tiap promo berdasarkan kondisi saat ini.
+   *  --- celah async (mis. menunggu respons payment gateway) ---
+   *  FASE 2 (commit): baca ULANG kondisi stok & kuota promo (bisa saja sudah berubah
+   *  karena transaksi lain), sesuaikan/batalkan otomatis apa yang sudah tidak valid,
+   *  lalu hitung ulang total secara final sebelum benar-benar mengunci stok & kuota.
    */
-  checkout(cartItems: CartItem[], couponCode?: string): CheckoutResult {
+  async checkout(cartItems: CartItem[], promoCodes: string[] = [], options: CheckoutOptions = {}): Promise<CheckoutResult> {
+    const now = options.now ?? new Date();
+    const paymentMethod = options.paymentMethod;
+
     if (!cartItems || cartItems.length === 0) {
       throw new CheckoutError("Keranjang belanja kosong.");
     }
 
-    // 1. Validasi stok
+    // Validasi stok awal (fail-fast jika dari awal memang sudah tidak cukup)
     const shortages = this.checkCartStock(cartItems);
     if (shortages.length > 0) {
       const detail = shortages
@@ -230,35 +338,127 @@ class CheckoutEngine {
       throw new CheckoutError(`Stok tidak mencukupi untuk: ${detail}.`);
     }
 
-    // 2. Hitung subtotal
-    const { items, subtotal } = this.calculateSubtotal(cartItems);
+    const { items, subtotal, categorySubtotals } = this.buildItemLines(cartItems);
 
-    // 3. Terapkan kupon jika diberikan
-    let discount = 0;
-    let couponApplied: string | null = null;
+    // ---- FASE 1: evaluasi tiap kode promo (tentatif, belum mengunci kuota) ----
+    const uniqueCodes = Array.from(new Set(promoCodes.map((c) => c.toUpperCase())));
+    const candidates: { promo: Promo; discount: number }[] = [];
+    const rejectedPromos: RejectedPromoDetail[] = [];
 
-    if (couponCode) {
-      const result = this.applyCoupon(couponCode, subtotal);
-      discount = result.discount;
-      couponApplied = result.coupon.code;
+    for (const code of uniqueCodes) {
+      const promo = this.promos.get(code);
+      if (!promo) {
+        rejectedPromos.push({ code, reason: "Kode promo tidak ditemukan atau sudah tidak berlaku." });
+        continue;
+      }
+      const evaluation = this.evaluatePromo(promo, {
+        cartSubtotal: subtotal,
+        categorySubtotals,
+        paymentMethod,
+        now,
+        totalRequested: uniqueCodes.length,
+      });
+      if (!evaluation.valid) {
+        rejectedPromos.push({ code: promo.code, reason: evaluation.reason! });
+        continue;
+      }
+      candidates.push({ promo, discount: evaluation.discount! });
     }
 
-    const total = subtotal - discount;
+    // ---- CELAH ASYNC: simulasi jeda proses (mis. menunggu payment gateway) ----
+    // Di sinilah, pada sistem nyata dengan banyak transaksi bersamaan, stok atau
+    // kuota promo bisa berubah akibat checkout customer lain yang selesai lebih dulu.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-    // 4. Kurangi stok (checkout dianggap final/berhasil)
-    for (const item of cartItems) {
-      const product = this.products.get(item.productId)!;
-      product.stock -= item.quantity;
+    // ---- FASE 2: commit-time re-validation ----
+    const warnings: string[] = [];
+    const finalItems: ItemLine[] = [];
+    let finalSubtotal = 0;
+    const finalCategorySubtotals = new Map<string, number>();
+
+    for (const line of items) {
+      const liveProduct = this.products.get(line.productId)!;
+      let finalQty = line.quantity;
+      let adjusted = false;
+
+      if (liveProduct.stock < finalQty) {
+        const available = Math.max(0, liveProduct.stock);
+        warnings.push(
+          `Stok "${liveProduct.name}" berubah saat proses checkout (tersisa ${available}). ` +
+            `Kuantitas otomatis disesuaikan dari ${finalQty} menjadi ${available}.`
+        );
+        finalQty = available;
+        adjusted = true;
+      }
+
+      const finalLineSubtotal = liveProduct.price * finalQty;
+      finalSubtotal += finalLineSubtotal;
+      finalCategorySubtotals.set(
+        line.category,
+        (finalCategorySubtotals.get(line.category) ?? 0) + finalLineSubtotal
+      );
+
+      finalItems.push({ ...line, quantity: finalQty, subtotal: finalLineSubtotal, adjusted });
+    }
+
+    // Re-evaluasi tiap promo kandidat terhadap kondisi FINAL, lalu kunci kuotanya
+    const appliedPromos: AppliedPromoDetail[] = [];
+
+    for (const cand of candidates) {
+      const recheck = this.evaluatePromo(cand.promo, {
+        cartSubtotal: finalSubtotal,
+        categorySubtotals: finalCategorySubtotals,
+        paymentMethod,
+        now,
+        totalRequested: candidates.length,
+      });
+
+      if (!recheck.valid) {
+        warnings.push(`Promo "${cand.promo.code}" otomatis dibatalkan saat checkout: ${recheck.reason}`);
+        rejectedPromos.push({ code: cand.promo.code, reason: recheck.reason! });
+        continue;
+      }
+
+      if (cand.promo.dailyQuota !== undefined) {
+        const locked = this.reserveQuota(cand.promo.code, cand.promo.dailyQuota, now);
+        if (!locked) {
+          warnings.push(`Promo "${cand.promo.code}" otomatis dibatalkan: kuota harian baru saja habis terpakai.`);
+          rejectedPromos.push({ code: cand.promo.code, reason: "Kuota harian habis." });
+          continue;
+        }
+      }
+
+      appliedPromos.push({
+        code: cand.promo.code,
+        scope: cand.promo.scope,
+        valueType: cand.promo.valueType,
+        discount: recheck.discount!,
+      });
+    }
+
+    let totalDiscount = appliedPromos.reduce((sum, p) => sum + p.discount, 0);
+    if (totalDiscount > finalSubtotal) totalDiscount = finalSubtotal; // jaga total tidak minus
+    const total = finalSubtotal - totalDiscount;
+
+    // Kunci stok final (hanya untuk qty > 0)
+    for (const line of finalItems) {
+      if (line.quantity > 0) {
+        const p = this.products.get(line.productId)!;
+        p.stock -= line.quantity;
+      }
     }
 
     return {
       success: true,
-      message: "Checkout berhasil.",
-      items,
-      subtotal,
-      discount,
-      couponApplied,
+      message: warnings.length > 0 ? "Checkout berhasil dengan penyesuaian otomatis." : "Checkout berhasil.",
+      items: finalItems,
+      subtotal: finalSubtotal,
+      totalDiscount,
+      appliedPromos,
+      rejectedPromos,
+      warnings,
       total,
+      paymentMethod,
     };
   }
 }
@@ -271,84 +471,137 @@ function formatRupiah(amount: number): string {
   return `Rp${amount.toLocaleString("id-ID")}`;
 }
 
-function main() {
-  // Data awal: daftar produk
-  const initialProducts: Product[] = [
-    { id: "P001", name: "Kaos Polos Hitam", price: 75000, stock: 10 },
-    { id: "P002", name: "Celana Jeans", price: 250000, stock: 5 },
-    { id: "P003", name: "Sepatu Sneakers", price: 450000, stock: 2 },
-  ];
-
-  // Data awal: daftar kupon
-  const initialCoupons: Coupon[] = [
-    { code: "DISKON10", type: "PERCENTAGE", value: 10, maxDiscount: 50000 },
-    { code: "POTONG20K", type: "FIXED", value: 20000, minPurchase: 100000 },
-  ];
-
-  const engine = new CheckoutEngine(initialProducts, initialCoupons);
-
-  console.log("=== CONTOH 1: Cek stok produk ===");
-  console.log("Stok P001 cukup untuk 3 pcs?", engine.checkStock("P001", 3)); // true
-  console.log("Stok P003 cukup untuk 5 pcs?", engine.checkStock("P003", 5)); // false
+function printResult(label: string, result: CheckoutResult) {
+  console.log(`--- ${label} ---`);
+  result.items.forEach((it) => {
+    const tag = it.adjusted ? " (DISESUAIKAN)" : "";
+    console.log(`  ${it.name}: ${it.requestedQuantity} -> ${it.quantity} pcs${tag} = ${formatRupiah(it.subtotal)}`);
+  });
+  console.log("  Subtotal:", formatRupiah(result.subtotal));
+  result.appliedPromos.forEach((p) => console.log(`  Promo diterapkan [${p.code}]: -${formatRupiah(p.discount)}`));
+  result.rejectedPromos.forEach((p) => console.log(`  Promo ditolak [${p.code}]: ${p.reason}`));
+  result.warnings.forEach((w) => console.log(`  WARNING: ${w}`));
+  console.log("  Total diskon:", formatRupiah(result.totalDiscount));
+  console.log("  TOTAL BAYAR:", formatRupiah(result.total));
   console.log();
-
-  console.log("=== CONTOH 2: Hitung subtotal belanja ===");
-  const cart: CartItem[] = [
-    { productId: "P001", quantity: 2 }, // 2 x 75.000
-    { productId: "P002", quantity: 1 }, // 1 x 250.000
-  ];
-  const subtotalResult = engine.calculateSubtotal(cart);
-  subtotalResult.items.forEach((it) =>
-    console.log(`- ${it.name} x${it.quantity} = ${formatRupiah(it.subtotal)}`)
-  );
-  console.log("Subtotal:", formatRupiah(subtotalResult.subtotal));
-  console.log();
-
-  console.log("=== CONTOH 3: Checkout dengan kupon persentase (DISKON10) ===");
-  try {
-    const result1 = engine.checkout(cart, "DISKON10");
-    console.log(JSON.stringify(result1, null, 2));
-    console.log("Total bayar:", formatRupiah(result1.total));
-  } catch (err) {
-    if (err instanceof CheckoutError) {
-      console.error("Checkout gagal:", err.message);
-    } else {
-      throw err;
-    }
-  }
-  console.log();
-
-  console.log("=== CONTOH 4: Checkout dengan kupon nominal tetap (POTONG20K) ===");
-  const engine2 = new CheckoutEngine(initialProducts, initialCoupons); // reset stok
-  try {
-    const cart2: CartItem[] = [{ productId: "P002", quantity: 1 }];
-    const result2 = engine2.checkout(cart2, "POTONG20K");
-    console.log("Total bayar:", formatRupiah(result2.total));
-  } catch (err) {
-    if (err instanceof CheckoutError) console.error("Checkout gagal:", err.message);
-  }
-  console.log();
-
-  console.log("=== CONTOH 5: Checkout gagal karena stok tidak cukup ===");
-  const engine3 = new CheckoutEngine(initialProducts, initialCoupons);
-  try {
-    const cartGagal: CartItem[] = [{ productId: "P003", quantity: 10 }]; // stok hanya 2
-    engine3.checkout(cartGagal);
-  } catch (err) {
-    if (err instanceof CheckoutError) console.error("Checkout gagal:", err.message);
-  }
-  console.log();
-
-  console.log("=== CONTOH 6: Checkout gagal karena kupon tidak valid ===");
-  const engine4 = new CheckoutEngine(initialProducts, initialCoupons);
-  try {
-    engine4.checkout([{ productId: "P001", quantity: 1 }], "KUPONNGASAL");
-  } catch (err) {
-    if (err instanceof CheckoutError) console.error("Checkout gagal:", err.message);
-  }
 }
 
-main();
+async function main() {
+  const baseProducts: Product[] = [
+    { id: "P001", name: "Kaos Polos Hitam", price: 75000, stock: 10, category: "FASHION" },
+    { id: "P002", name: "Celana Jeans", price: 250000, stock: 5, category: "FASHION" },
+    { id: "P003", name: "Sepatu Sneakers", price: 450000, stock: 3, category: "FASHION" },
+    { id: "P004", name: "Power Bank 10000mAh", price: 180000, stock: 4, category: "ELECTRONICS" },
+  ];
+
+  const basePromos: Promo[] = [
+    // 1. Diskon kategori FASHION 15%, bisa digabung promo lain
+    { code: "FASHION15", valueType: "PERCENTAGE", value: 15, scope: "CATEGORY", categoryId: "FASHION", maxDiscount: 100000, stackable: true },
+    // 2. Diskon metode pembayaran GoPay, potongan tetap Rp10.000
+    { code: "GOPAY10K", valueType: "FIXED", value: 10000, scope: "PAYMENT_METHOD", paymentMethod: "GOPAY", minPurchase: 50000, stackable: true },
+    // 3. Flash sale jam 12:00-14:00, diskon 20% dari total belanja, kuota 2 transaksi/hari
+    { code: "FLASHJAM12", valueType: "PERCENTAGE", value: 20, scope: "CART", schedule: { startHour: 12, endHour: 14 }, dailyQuota: 2, maxDiscount: 150000, stackable: true },
+    // 4. Promo eksklusif: tidak bisa digabung promo lain
+    { code: "EXCLUSIVE50K", valueType: "FIXED", value: 50000, scope: "CART", minPurchase: 300000, stackable: false },
+  ];
+
+  // Waktu simulasi: dalam jendela flash sale (jam 13:00)
+  const duringFlashSale = new Date();
+  duringFlashSale.setHours(13, 0, 0, 0);
+
+  // Waktu simulasi: di luar jendela flash sale (jam 09:00)
+  const outsideFlashSale = new Date();
+  outsideFlashSale.setHours(9, 0, 0, 0);
+
+  // ============================================================
+  console.log("=== SKENARIO 1: Stacking - Diskon Kategori + Diskon GoPay ===");
+  const engine1 = new CheckoutEngine(baseProducts, basePromos);
+  const result1 = await engine1.checkout(
+    [
+      { productId: "P001", quantity: 2 }, // FASHION
+      { productId: "P004", quantity: 1 }, // ELECTRONICS (tidak kena FASHION15)
+    ],
+    ["FASHION15", "GOPAY10K"],
+    { paymentMethod: "GOPAY", now: outsideFlashSale }
+  );
+  printResult("Stacking 2 promo sekaligus", result1);
+
+  // ============================================================
+  console.log("=== SKENARIO 2: Flash Sale - dalam jendela waktu (berhasil) ===");
+  const engine2 = new CheckoutEngine(baseProducts, basePromos);
+  const result2 = await engine2.checkout(
+    [{ productId: "P002", quantity: 1 }],
+    ["FLASHJAM12"],
+    { now: duringFlashSale }
+  );
+  printResult("Checkout jam 13:00 (dalam jendela flash sale)", result2);
+
+  // ============================================================
+  console.log("=== SKENARIO 3: Flash Sale - di luar jendela waktu (promo ditolak) ===");
+  const engine3 = new CheckoutEngine(baseProducts, basePromos);
+  const result3 = await engine3.checkout(
+    [{ productId: "P002", quantity: 1 }],
+    ["FLASHJAM12"],
+    { now: outsideFlashSale }
+  );
+  printResult("Checkout jam 09:00 (di luar jendela flash sale)", result3);
+
+  // ============================================================
+  console.log("=== SKENARIO 4: Promo eksklusif ditolak karena digabung promo lain ===");
+  const engine4 = new CheckoutEngine(baseProducts, basePromos);
+  const result4 = await engine4.checkout(
+    [{ productId: "P002", quantity: 2 }], // 2 x 250.000 = 500.000, penuhi minPurchase EXCLUSIVE50K
+    ["EXCLUSIVE50K", "GOPAY10K"],
+    { paymentMethod: "GOPAY", now: outsideFlashSale }
+  );
+  printResult("EXCLUSIVE50K digabung dengan GOPAY10K", result4);
+
+  // ============================================================
+  console.log("=== SKENARIO 5 (EDGE CASE): Stok mendadak habis di tengah proses checkout ===");
+  const engine5 = new CheckoutEngine(baseProducts, basePromos);
+  // Checkout dimulai (belum di-await) untuk 2 pcs Sepatu Sneakers (stok awal 3)...
+  const checkoutPromise5 = engine5.checkout(
+    [{ productId: "P003", quantity: 2 }],
+    ["FASHION15"],
+    { now: outsideFlashSale }
+  );
+  // ...tapi TEPAT SETELAH itu, sistem lain "menyerobot" stok hingga tersisa 1 (simulasi race condition)
+  engine5.simulateExternalStockChange("P003", 1);
+  const result5 = await checkoutPromise5;
+  printResult("Stok Sneakers berubah 3 -> 1 di tengah proses (qty diminta 2)", result5);
+
+  // ============================================================
+  console.log("=== SKENARIO 6 (EDGE CASE): Kuota flash sale habis di tengah proses checkout ===");
+  const engine6 = new CheckoutEngine(baseProducts, basePromos);
+  const checkoutPromise6 = engine6.checkout(
+    [{ productId: "P002", quantity: 1 }],
+    ["FLASHJAM12"],
+    { now: duringFlashSale }
+  );
+  // Di tengah proses, kuota FLASHJAM12 "habis diserobot" transaksi lain (2/2 terpakai)
+  engine6.simulateExternalPromoUsage("FLASHJAM12", 2, duringFlashSale);
+  const result6 = await checkoutPromise6;
+  printResult("Kuota FLASHJAM12 habis (2/2) tepat sebelum commit", result6);
+}
+
+main().catch((err) => {
+  if (err instanceof CheckoutError) {
+    console.error("Checkout gagal:", err.message);
+  } else {
+    console.error("Terjadi kesalahan tak terduga:", err);
+  }
+});
 
 // Export untuk digunakan di file/modul lain
-export { CheckoutEngine, CheckoutError, Product, Coupon, CartItem, CheckoutResult };
+export {
+  CheckoutEngine,
+  CheckoutError,
+  Product,
+  Promo,
+  CartItem,
+  CheckoutResult,
+  ItemLine,
+  AppliedPromoDetail,
+  RejectedPromoDetail,
+  CheckoutOptions,
+};
