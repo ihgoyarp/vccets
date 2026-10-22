@@ -1,0 +1,109 @@
+/**
+ * promotion.types.ts
+ * -----------------------------------------------------------------------------
+ * Domain: Promotion Engine
+ * Cakupan saat ini: diskon TUNGGAL (single discount) — persentase & nominal tetap.
+ * Struktur union dibuat agar mudah diperluas ke stacking/multi-promo di masa depan
+ * tanpa breaking change (lihat catatan di bagian bawah file).
+ * Tidak ada logika implementasi — murni interfaces & types.
+ * -----------------------------------------------------------------------------
+ */
+
+import type { DateRange, DomainError, Money, PromotionCode, PromotionId, Result } from './common.types';
+
+// ---------------------------------------------------------------------------
+// Discount type discriminant
+// ---------------------------------------------------------------------------
+
+export type DiscountType = 'PERCENTAGE' | 'FIXED_AMOUNT';
+
+/**
+ * Field bersama untuk semua jenis promosi, terlepas dari tipe diskonnya.
+ */
+export interface BasePromotion {
+  readonly id: PromotionId;
+  readonly code: PromotionCode;
+  readonly name: string;
+  readonly isActive: boolean;
+  readonly validity: DateRange;
+  /** Jumlah minimum belanja (subtotal) agar promo berlaku. Opsional. */
+  readonly minimumSpend?: Money;
+}
+
+/**
+ * Diskon persentase. `percentage` dibatasi 0–100 secara konseptual;
+ * validasi rentang nilai dilakukan di layer implementasi/validator,
+ * bentuk tipe di sini hanya `number`.
+ */
+export interface PercentageDiscountPromotion extends BasePromotion {
+  readonly discountType: 'PERCENTAGE';
+  readonly percentage: number;
+  /** Batas maksimum potongan dalam nominal uang, agar diskon % tidak tak terbatas. */
+  readonly maxDiscountAmount?: Money;
+}
+
+/**
+ * Diskon nominal tetap (mis. potongan Rp 20.000).
+ */
+export interface FixedAmountDiscountPromotion extends BasePromotion {
+  readonly discountType: 'FIXED_AMOUNT';
+  readonly amount: Money;
+}
+
+/**
+ * Union diskon tunggal — konsumen tipe ini WAJIB melakukan narrowing
+ * berdasarkan `discountType` sebelum mengakses field spesifik (`percentage` / `amount`).
+ */
+export type Promotion = PercentageDiscountPromotion | FixedAmountDiscountPromotion;
+
+// ---------------------------------------------------------------------------
+// Validation & application results
+// ---------------------------------------------------------------------------
+
+export type PromotionValidationFailureReason =
+  | 'PROMOTION_INACTIVE'
+  | 'PROMOTION_EXPIRED'
+  | 'PROMOTION_NOT_STARTED'
+  | 'MINIMUM_SPEND_NOT_MET'
+  | 'PROMOTION_NOT_FOUND'
+  | 'CURRENCY_MISMATCH'
+  | 'INVALID_DISCOUNT_VALUE';
+
+export interface PromotionValidationContext {
+  readonly subtotal: Money;
+  readonly evaluatedAt: Date;
+}
+
+export interface PromotionApplicationResult {
+  readonly promotionId: PromotionId;
+  readonly discountType: DiscountType;
+  /** Nilai potongan akhir dalam Money, setelah memperhitungkan cap (jika ada). */
+  readonly discountAmount: Money;
+  /** Total setelah dikurangi diskon. */
+  readonly amountAfterDiscount: Money;
+}
+
+// ---------------------------------------------------------------------------
+// Service contract
+// ---------------------------------------------------------------------------
+
+export interface IPromotionRepository {
+  findById(promotionId: PromotionId): Promise<Promotion | null>;
+  findByCode(code: PromotionCode): Promise<Promotion | null>;
+}
+
+/**
+ * Kontrak Promotion Engine untuk diskon TUNGGAL.
+ * Catatan desain untuk pengembangan lanjut (Change Request stacking discount):
+ * method `applyDiscount` menerima satu `Promotion`, bukan array — evolusi ke
+ * multi-promo dapat dilakukan dengan menambah method baru (mis. `applyDiscounts`)
+ * tanpa mengubah kontrak yang sudah ada (Open/Closed Principle).
+ */
+export interface IPromotionEngine {
+  validatePromotion(
+    promotion: Promotion,
+    context: PromotionValidationContext
+  ): Result<true, DomainError<PromotionValidationFailureReason>>;
+
+  applyDiscount(baseAmount: Money, promotion: Promotion): Result<PromotionApplicationResult, DomainError<PromotionValidationFailureReason>>;
+}
